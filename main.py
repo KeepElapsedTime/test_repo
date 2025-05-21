@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# 添加 CORS 中間件
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,7 +26,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic 模型
+# Pydantic 模型保持不變
 class Message(BaseModel):
     role: str
     content: str
@@ -65,32 +64,32 @@ def get_current_datetime():
     return datetime.utcnow().isoformat() + "Z"
 
 def load_model(model_name: str):
-    """加載模型和tokenizer"""
+    """加載模型和tokenizer，使用更快的設置"""
     if model_name not in loaded_models:
         model_path = MODEL_CONFIGS[model_name]
         start_time = time.time()
         
-        tokenizer = AutoTokenizer.from_pretrained(model_path)
-        tokenizer.chat_template = (
-            "{% set loop_messages = messages %}"
-            "{% for message in loop_messages %}"
-            "{% set content = '<|start_header_id|>' + message['role']+'<|end_header_id|>\n\n'+ "
-            "message['content'] | trim + '<|eot_id|>' %}"
-            "{% if loop.index0 == 0 %}"
-            "{% set content = bos_token + content %} "
-            "{% endif %}"
-            "{{ content }}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}"
-            "{{ '<|start_header_id|>assistant<|end_header_id|>\n\n' }}"
-            "{% endif %}"
+        # 使用快速加載選項
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            legacy=False,  # 使用更快的tokenizer實現
+            use_fast=True  # 使用快速tokenizer
         )
         
+        # 使用更簡單的chat template
+        tokenizer.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}User: {{ message['content'] }}{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{% elif message['role'] == 'system' %}System: {{ message['content'] }}{% endif %}\n{% endfor %}\nAssistant:"
+        
+        # 使用更優化的模型設置
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
-            device_map="auto"
+            device_map="auto",
+            low_cpu_mem_usage=True,
+            use_flash_attention_2=True,  # 如果支持的話使用Flash Attention 2
         )
+        
+        # 設置為評估模式
+        model.eval()
         
         load_duration = int((time.time() - start_time) * 1e9)
         
@@ -102,18 +101,22 @@ def load_model(model_name: str):
     
     return loaded_models[model_name]
 
-def chunk_text(text: str, chunk_size: int = 3) -> List[str]:
-    """將文本分成chunks"""
+def process_chunks(text: str) -> List[str]:
+    """更快的分塊策略"""
+    # 對於較短的文本，直接作為一個塊返回
+    if len(text) < 50:
+        return [text]
+    
+    # 使用更大的塊大小，減少流式傳輸的次數
+    chunk_size = 10  # 每個塊10個詞
     words = text.split()
     chunks = []
-    current_chunk = []
     
-    for i, word in enumerate(words):
-        current_chunk.append(word)
-        if len(current_chunk) >= chunk_size or i == len(words) - 1:
-            chunks.append(" ".join(current_chunk) + " ")
-            current_chunk = []
-            
+    for i in range(0, len(words), chunk_size):
+        chunk = " ".join(words[i:i + chunk_size])
+        if chunk:
+            chunks.append(chunk + " ")
+    
     return chunks
 
 async def stream_generate(
@@ -122,7 +125,7 @@ async def stream_generate(
     stats: Dict[str, Any],
     is_chat: bool = False
 ) -> AsyncGenerator[str, None]:
-    """通用的串流生成器"""
+    """優化的串流生成器"""
     for i, chunk in enumerate(text_chunks):
         is_last = i == len(text_chunks) - 1
         
@@ -149,7 +152,9 @@ async def stream_generate(
             response_data.update(stats)
         
         yield json.dumps(response_data) + "\n"
-        await asyncio.sleep(0.05)
+        
+        # 減少延遲時間
+        await asyncio.sleep(0.01)  # 從0.05減少到0.01
 
 async def generate_text(
     model_name: str,
@@ -157,7 +162,7 @@ async def generate_text(
     system: Optional[str] = None,
     input_messages: Optional[List[Message]] = None
 ) -> tuple[str, Dict[str, Any]]:
-    """生成文本並返回統計信息"""
+    """優化的文本生成"""
     start_time = time.time()
     
     model_data = load_model(model_name)
@@ -188,21 +193,21 @@ async def generate_text(
     prompt_eval_duration = int((time.time() - encoding_start) * 1e9)
     prompt_eval_count = input_ids.shape[1]
     
-    # 生成配置
+    # 優化的生成配置
     generation_config = {
-        "max_new_tokens": 256,
+        "max_new_tokens": 128,  # 減少最大token數
         "do_sample": True,
         "temperature": 0.7,
         "top_p": 0.9,
         "repetition_penalty": 1.1,
-        "no_repeat_ngram_size": 3,
         "pad_token_id": tokenizer.eos_token_id,
         "eos_token_id": tokenizer.eos_token_id,
+        "use_cache": True,  # 使用KV緩存
     }
     
     # 生成文本
     generation_start = time.time()
-    with torch.no_grad():
+    with torch.no_grad(), torch.cuda.amp.autocast():  # 使用自動混合精度
         outputs = model.generate(
             input_ids,
             **generation_config
@@ -247,7 +252,7 @@ async def generate(request: GenerateRequest):
         
         # 根據 stream 參數決定返回方式
         if request.stream:
-            chunks = chunk_text(response)
+            chunks = process_chunks(response)
             return StreamingResponse(
                 stream_generate(
                     text_chunks=chunks,
@@ -283,13 +288,13 @@ async def chat(request: ChatRequest):
         # 生成回應
         response, stats = await generate_text(
             model_name=request.model,
-            prompt="",  # 不需要額外的提示詞
+            prompt="",
             input_messages=request.messages
         )
         
         # 根據 stream 參數決定返回方式
         if request.stream:
-            chunks = chunk_text(response)
+            chunks = process_chunks(response)
             return StreamingResponse(
                 stream_generate(
                     text_chunks=chunks,
