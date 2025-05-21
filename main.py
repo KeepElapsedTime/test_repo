@@ -9,13 +9,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import logging
 import traceback
 
-# 設置日誌記錄
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# Enable CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 定義請求模型
 class GenerateRequest(BaseModel):
     model: str
     prompt: str
@@ -38,7 +35,6 @@ class GenerateResponse(BaseModel):
     response: str
     done: bool
 
-# 模型配置
 MODEL_CONFIGS = {
     "jais-family-30b-16k-chat": "inceptionai/jais-family-30b-16k-chat",
     "jais-family-30b-8k-chat": "inceptionai/jais-family-30b-8k-chat",
@@ -61,15 +57,31 @@ def load_model(model_name: str):
             logger.info(f"Loading model {model_name} from {model_path}")
             logger.info(f"Using device: {device}")
             
-            tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            # 設置 tokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_path,
+                trust_remote_code=True,
+                padding_side="left"  # 確保padding在左側
+            )
+            
+            # 確保設置特殊token
+            if tokenizer.pad_token is None:
+                if tokenizer.eos_token is not None:
+                    tokenizer.pad_token = tokenizer.eos_token
+                else:
+                    tokenizer.pad_token = tokenizer.eos_token = "</s>"
+                    
             logger.info("Tokenizer loaded successfully")
             
+            # 加載模型
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 device_map="auto",
                 trust_remote_code=True,
-                torch_dtype=torch.float16  # 使用 float16 來減少內存使用
+                torch_dtype=torch.float16,
+                pad_token_id=tokenizer.pad_token_id
             )
+            
             logger.info("Model loaded successfully")
             
             loaded_models[model_name] = {
@@ -93,27 +105,46 @@ def get_response(text: str, model_name: str):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         logger.info(f"Generating response using device: {device}")
         
-        input_ids = tokenizer(text, return_tensors="pt").input_ids
-        inputs = input_ids.to(device)
-        input_len = inputs.shape[-1]
+        # 正確設置 tokenizer 輸入
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048,
+            return_attention_mask=True
+        )
         
+        # 將所有輸入移到正確的設備上
+        input_ids = inputs["input_ids"].to(device)
+        attention_mask = inputs["attention_mask"].to(device)
+        
+        input_len = input_ids.shape[-1]
         logger.info(f"Input length: {input_len}")
         
+        # 生成回應
         generate_ids = model.generate(
-            inputs,
+            input_ids,
+            attention_mask=attention_mask,
+            pad_token_id=tokenizer.pad_token_id,
             top_p=0.9,
             temperature=0.3,
             max_length=2048,
             min_length=input_len + 4,
             repetition_penalty=1.2,
             do_sample=True,
+            eos_token_id=tokenizer.eos_token_id
         )
         
+        # 解碼回應
         response = tokenizer.batch_decode(
             generate_ids,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=True
         )[0]
+        
+        # 移除輸入文本
+        response = response[len(text):].strip()
         
         return response
     except Exception as e:
@@ -135,7 +166,7 @@ async def generate(request: GenerateRequest):
     """處理生成請求的端點"""
     try:
         logger.info(f"Received request for model: {request.model}")
-        logger.info(f"Prompt: {request.prompt[:100]}...")  # 只記錄前100個字符
+        logger.info(f"Prompt: {request.prompt[:100]}...")
         
         if request.model not in MODEL_CONFIGS:
             raise HTTPException(status_code=404, detail=f"Model {request.model} not found")
