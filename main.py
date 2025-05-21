@@ -3,12 +3,7 @@ from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Union, Any, AsyncGenerator
 import torch
-from transformers import (
-    AutoTokenizer, 
-    AutoModelForCausalLM,
-    StoppingCriteriaList,
-    MaxLengthCriteria
-)
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import uvicorn
 from fastapi.middleware.cors import CORSMiddleware
 import time
@@ -175,7 +170,7 @@ async def generate_text(
     if input_messages:
         conversation = [{"role": msg.role, "content": msg.content} 
                        for msg in input_messages]
-        inputs = tokenizer.apply_chat_template(
+        input_ids = tokenizer.apply_chat_template(
             conversation=conversation,
             tokenize=True,
             add_generation_prompt=True,
@@ -188,9 +183,10 @@ async def generate_text(
             return_tensors="pt",
             return_attention_mask=True
         ).to(model.device)
+        input_ids = inputs.input_ids
     
     prompt_eval_duration = int((time.time() - encoding_start) * 1e9)
-    prompt_eval_count = inputs.input_ids.shape[1]
+    prompt_eval_count = input_ids.shape[1]
     
     # 生成配置
     generation_config = {
@@ -202,29 +198,23 @@ async def generate_text(
         "no_repeat_ngram_size": 3,
         "pad_token_id": tokenizer.eos_token_id,
         "eos_token_id": tokenizer.eos_token_id,
-        "return_dict_in_generate": True,
-        "output_scores": True,
     }
     
     # 生成文本
     generation_start = time.time()
     with torch.no_grad():
         outputs = model.generate(
-            input_ids if input_messages else inputs.input_ids,
-            attention_mask=None if input_messages else inputs.attention_mask,
-            **generation_config,
-            stopping_criteria=StoppingCriteriaList([
-                MaxLengthCriteria(max_length=512)
-            ])
+            input_ids,
+            **generation_config
         )
     
     # 解碼輸出
-    start_idx = inputs.input_ids.shape[1] if input_messages else inputs.input_ids.shape[1]
-    response = tokenizer.decode(outputs.sequences[0][start_idx:], skip_special_tokens=True)
+    start_idx = input_ids.shape[1]
+    response = tokenizer.decode(outputs[0][start_idx:], skip_special_tokens=True)
     
     # 計算統計信息
     eval_duration = int((time.time() - generation_start) * 1e9)
-    eval_count = outputs.sequences.shape[1] - start_idx
+    eval_count = outputs.shape[1] - start_idx
     total_duration = int((time.time() - start_time) * 1e9)
     
     stats = {
