@@ -63,6 +63,7 @@ loaded_models = {}
 def get_current_datetime():
     return datetime.utcnow().isoformat() + "Z"
 
+
 def load_model(model_name: str):
     """加載模型和tokenizer，使用更快的設置"""
     if model_name not in loaded_models:
@@ -79,16 +80,15 @@ def load_model(model_name: str):
         # 使用更簡單的chat template
         tokenizer.chat_template = "{% for message in messages %}{% if message['role'] == 'user' %}User: {{ message['content'] }}{% elif message['role'] == 'assistant' %}Assistant: {{ message['content'] }}{% elif message['role'] == 'system' %}System: {{ message['content'] }}{% endif %}\n{% endfor %}\nAssistant:"
         
-        # 使用更優化的模型設置
+        # 移除 Flash Attention 2 設置
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map="auto",
-            low_cpu_mem_usage=True,
-            use_flash_attention_2=True,  # 如果支持的話使用Flash Attention 2
+            low_cpu_mem_usage=True
         )
         
-        # 設置為評估模式
+        # 設置為評估模式以提升推理速度
         model.eval()
         
         load_duration = int((time.time() - start_time) * 1e9)
