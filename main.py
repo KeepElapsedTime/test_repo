@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Union, Any
+from typing import List, Optional, Dict, Union, Any, AsyncGenerator
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import uvicorn
@@ -9,6 +10,7 @@ import time
 import logging
 from datetime import datetime
 import json
+import asyncio
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,7 +25,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Pydantic models
+# Pydantic models (保持不變)
 class Message(BaseModel):
     role: str
     content: str
@@ -81,6 +83,7 @@ MODEL_CONFIGS = {
 
 loaded_models = {}
 
+# Helper functions (保持不變)
 def get_current_datetime():
     return datetime.utcnow().isoformat() + "Z"
 
@@ -90,7 +93,6 @@ def load_model(model_name: str):
         model_path = MODEL_CONFIGS[model_name]
         start_time = time.time()
         
-        # 載入 tokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         tokenizer.chat_template = (
             "{% set loop_messages = messages %}"
@@ -107,14 +109,13 @@ def load_model(model_name: str):
             "{% endif %}"
         )
         
-        # 載入模型
         model = AutoModelForCausalLM.from_pretrained(
             model_path,
             torch_dtype=torch.bfloat16,
             device_map="auto"
         )
         
-        load_duration = int((time.time() - start_time) * 1e9)  # 轉換為納秒
+        load_duration = int((time.time() - start_time) * 1e9)
         
         loaded_models[model_name] = {
             "model": model,
@@ -124,28 +125,20 @@ def load_model(model_name: str):
     
     return loaded_models[model_name]
 
-def generate_response(
-    model_name: str,
-    prompt: str,
-    system: Optional[str] = None,
-    stream: bool = True
-) -> Union[GenerateResponse, List[GenerateResponse]]:
-    """生成回應"""
+async def generate_stream(model_name: str, prompt: str, system: Optional[str] = None) -> AsyncGenerator[str, None]:
+    """串流生成回應"""
     start_time = time.time()
     
-    # 載入模型
     model_data = load_model(model_name)
     model = model_data["model"]
     tokenizer = model_data["tokenizer"]
     load_duration = model_data["load_duration"]
     
-    # 組合提示詞
     if system:
         full_prompt = f"{system}\n\n{prompt}"
     else:
         full_prompt = prompt
     
-    # 準備輸入
     encoding_start = time.time()
     inputs = tokenizer(
         full_prompt,
@@ -156,19 +149,18 @@ def generate_response(
     prompt_eval_duration = int((time.time() - encoding_start) * 1e9)
     prompt_eval_count = inputs.input_ids.shape[1]
     
-    # 生成回應
     generation_start = time.time()
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=512,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        return_dict_in_generate=True,
-        output_scores=True
-    )
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            return_dict_in_generate=True,
+            output_scores=True
+        )
     
-    # 解碼回應
     response = tokenizer.decode(outputs.sequences[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
     
     eval_duration = int((time.time() - generation_start) * 1e9)
@@ -176,64 +168,43 @@ def generate_response(
     
     total_duration = int((time.time() - start_time) * 1e9)
     
-    if stream:
-        responses = []
-        # 模擬串流輸出
-        for i in range(0, len(response), 10):
-            chunk = response[i:i+10]
-            is_done = i + 10 >= len(response)
-            
-            resp = GenerateResponse(
-                model=model_name,
-                created_at=get_current_datetime(),
-                response=chunk,
-                done=is_done,
-                context=[1, 2, 3],  # 示例 context
-            )
-            
-            if is_done:
-                resp.total_duration = total_duration
-                resp.load_duration = load_duration
-                resp.prompt_eval_count = prompt_eval_count
-                resp.prompt_eval_duration = prompt_eval_duration
-                resp.eval_count = eval_count
-                resp.eval_duration = eval_duration
-            
-            responses.append(resp)
-        return responses
-    else:
-        return GenerateResponse(
-            model=model_name,
-            created_at=get_current_datetime(),
-            response=response,
-            done=True,
-            context=[1, 2, 3],  # 示例 context
-            total_duration=total_duration,
-            load_duration=load_duration,
-            prompt_eval_count=prompt_eval_count,
-            prompt_eval_duration=prompt_eval_duration,
-            eval_count=eval_count,
-            eval_duration=eval_duration
-        )
+    # 串流輸出
+    for i in range(0, len(response), 10):
+        chunk = response[i:i+10]
+        is_done = i + 10 >= len(response)
+        
+        response_data = {
+            "model": model_name,
+            "created_at": get_current_datetime(),
+            "response": chunk,
+            "done": is_done,
+            "context": [1, 2, 3]
+        }
+        
+        if is_done:
+            response_data.update({
+                "total_duration": total_duration,
+                "load_duration": load_duration,
+                "prompt_eval_count": prompt_eval_count,
+                "prompt_eval_duration": prompt_eval_duration,
+                "eval_count": eval_count,
+                "eval_duration": eval_duration
+            })
+        
+        yield json.dumps(response_data) + "\n"
+        await asyncio.sleep(0.01)  # 小延遲以模擬真實串流
 
-def chat_response(
-    model_name: str,
-    messages: List[Message],
-    stream: bool = True
-) -> Union[ChatResponse, List[ChatResponse]]:
-    """處理聊天請求"""
+async def chat_stream(model_name: str, messages: List[Message]) -> AsyncGenerator[str, None]:
+    """串流聊天回應"""
     start_time = time.time()
     
-    # 載入模型
     model_data = load_model(model_name)
     model = model_data["model"]
     tokenizer = model_data["tokenizer"]
     load_duration = model_data["load_duration"]
     
-    # 準備對話歷史
     conversation = [{"role": msg.role, "content": msg.content} for msg in messages]
     
-    # 使用 chat template 生成輸入
     encoding_start = time.time()
     input_ids = tokenizer.apply_chat_template(
         conversation=conversation,
@@ -245,19 +216,18 @@ def chat_response(
     prompt_eval_duration = int((time.time() - encoding_start) * 1e9)
     prompt_eval_count = input_ids.shape[1]
     
-    # 生成回應
     generation_start = time.time()
-    outputs = model.generate(
-        input_ids,
-        max_new_tokens=512,
-        do_sample=True,
-        temperature=0.7,
-        top_p=0.9,
-        return_dict_in_generate=True,
-        output_scores=True
-    )
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            return_dict_in_generate=True,
+            output_scores=True
+        )
     
-    # 解碼回應
     response = tokenizer.decode(outputs.sequences[0][input_ids.shape[1]:], skip_special_tokens=True)
     
     eval_duration = int((time.time() - generation_start) * 1e9)
@@ -265,49 +235,147 @@ def chat_response(
     
     total_duration = int((time.time() - start_time) * 1e9)
     
-    if stream:
-        responses = []
-        # 模擬串流輸出
-        for i in range(0, len(response), 10):
-            chunk = response[i:i+10]
-            is_done = i + 10 >= len(response)
-            
-            resp = ChatResponse(
-                model=model_name,
-                created_at=get_current_datetime(),
-                message=Message(
-                    role="assistant",
-                    content=chunk
-                ),
-                done=is_done
-            )
-            
-            if is_done:
-                resp.total_duration = total_duration
-                resp.load_duration = load_duration
-                resp.prompt_eval_count = prompt_eval_count
-                resp.prompt_eval_duration = prompt_eval_duration
-                resp.eval_count = eval_count
-                resp.eval_duration = eval_duration
-            
-            responses.append(resp)
-        return responses
+    # 串流輸出
+    for i in range(0, len(response), 10):
+        chunk = response[i:i+10]
+        is_done = i + 10 >= len(response)
+        
+        response_data = {
+            "model": model_name,
+            "created_at": get_current_datetime(),
+            "message": {
+                "role": "assistant",
+                "content": chunk
+            },
+            "done": is_done
+        }
+        
+        if is_done:
+            response_data.update({
+                "total_duration": total_duration,
+                "load_duration": load_duration,
+                "prompt_eval_count": prompt_eval_count,
+                "prompt_eval_duration": prompt_eval_duration,
+                "eval_count": eval_count,
+                "eval_duration": eval_duration
+            })
+        
+        yield json.dumps(response_data) + "\n"
+        await asyncio.sleep(0.01)  # 小延遲以模擬真實串流
+
+def generate_response(model_name: str, prompt: str, system: Optional[str] = None) -> Dict:
+    """生成單一回應"""
+    start_time = time.time()
+    
+    model_data = load_model(model_name)
+    model = model_data["model"]
+    tokenizer = model_data["tokenizer"]
+    load_duration = model_data["load_duration"]
+    
+    if system:
+        full_prompt = f"{system}\n\n{prompt}"
     else:
-        return ChatResponse(
-            model=model_name,
-            created_at=get_current_datetime(),
-            message=Message(
-                role="assistant",
-                content=response
-            ),
-            done=True,
-            total_duration=total_duration,
-            load_duration=load_duration,
-            prompt_eval_count=prompt_eval_count,
-            prompt_eval_duration=prompt_eval_duration,
-            eval_count=eval_count,
-            eval_duration=eval_duration
+        full_prompt = prompt
+    
+    encoding_start = time.time()
+    inputs = tokenizer(
+        full_prompt,
+        return_tensors="pt",
+        return_attention_mask=True
+    ).to(model.device)
+    
+    prompt_eval_duration = int((time.time() - encoding_start) * 1e9)
+    prompt_eval_count = inputs.input_ids.shape[1]
+    
+    generation_start = time.time()
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            return_dict_in_generate=True,
+            output_scores=True
         )
+    
+    response = tokenizer.decode(outputs.sequences[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    
+    eval_duration = int((time.time() - generation_start) * 1e9)
+    eval_count = outputs.sequences.shape[1] - inputs.input_ids.shape[1]
+    
+    total_duration = int((time.time() - start_time) * 1e9)
+    
+    return {
+        "model": model_name,
+        "created_at": get_current_datetime(),
+        "response": response,
+        "done": True,
+        "context": [1, 2, 3],
+        "total_duration": total_duration,
+        "load_duration": load_duration,
+        "prompt_eval_count": prompt_eval_count,
+        "prompt_eval_duration": prompt_eval_duration,
+        "eval_count": eval_count,
+        "eval_duration": eval_duration
+    }
+
+def chat_response(model_name: str, messages: List[Message]) -> Dict:
+    """生成單一聊天回應"""
+    start_time = time.time()
+    
+    model_data = load_model(model_name)
+    model = model_data["model"]
+    tokenizer = model_data["tokenizer"]
+    load_duration = model_data["load_duration"]
+    
+    conversation = [{"role": msg.role, "content": msg.content} for msg in messages]
+    
+    encoding_start = time.time()
+    input_ids = tokenizer.apply_chat_template(
+        conversation=conversation,
+        tokenize=True,
+        add_generation_prompt=True,
+        return_tensors="pt"
+    ).to(model.device)
+    
+    prompt_eval_duration = int((time.time() - encoding_start) * 1e9)
+    prompt_eval_count = input_ids.shape[1]
+    
+    generation_start = time.time()
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids,
+            max_new_tokens=512,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            return_dict_in_generate=True,
+            output_scores=True
+        )
+    
+    response = tokenizer.decode(outputs.sequences[0][input_ids.shape[1]:], skip_special_tokens=True)
+    
+    eval_duration = int((time.time() - generation_start) * 1e9)
+    eval_count = outputs.sequences.shape[1] - input_ids.shape[1]
+    
+    total_duration = int((time.time() - start_time) * 1e9)
+    
+    return {
+        "model": model_name,
+        "created_at": get_current_datetime(),
+        "message": {
+            "role": "assistant",
+            "content": response
+        },
+        "done": True,
+        "total_duration": total_duration,
+        "load_duration": load_duration,
+        "prompt_eval_count": prompt_eval_count,
+        "prompt_eval_duration": prompt_eval_duration,
+        "eval_count": eval_count,
+        "eval_duration": eval_duration
+    }
 
 @app.post("/api/generate")
 async def generate(request: GenerateRequest):
@@ -319,20 +387,24 @@ async def generate(request: GenerateRequest):
                 detail=f"Model {request.model} not found. Available models: {list(MODEL_CONFIGS.keys())}"
             )
         
-        responses = generate_response(
-            model_name=request.model,
-            prompt=request.prompt,
-            system=request.system,
-            stream=request.stream if request.stream is not None else True
-        )
-        
-        if isinstance(responses, list):
-            # 串流回應
-            for response in responses:
-                yield response.model_dump()
+        # 根據 stream 參數決定返回方式
+        if request.stream:
+            return StreamingResponse(
+                generate_stream(
+                    model_name=request.model,
+                    prompt=request.prompt,
+                    system=request.system
+                ),
+                media_type="text/event-stream"
+            )
         else:
-            # 單一回應
-            return responses.model_dump()
+            return JSONResponse(
+                generate_response(
+                    model_name=request.model,
+                    prompt=request.prompt,
+                    system=request.system
+                )
+            )
             
     except Exception as e:
         logger.error(f"Error in generate endpoint: {str(e)}")
@@ -348,19 +420,22 @@ async def chat(request: ChatRequest):
                 detail=f"Model {request.model} not found. Available models: {list(MODEL_CONFIGS.keys())}"
             )
         
-        responses = chat_response(
-            model_name=request.model,
-            messages=request.messages,
-            stream=request.stream if request.stream is not None else True
-        )
-        
-        if isinstance(responses, list):
-            # 串流回應
-            for response in responses:
-                yield response.model_dump()
+        # 根據 stream 參數決定返回方式
+        if request.stream:
+            return StreamingResponse(
+                chat_stream(
+                    model_name=request.model,
+                    messages=request.messages
+                ),
+                media_type="text/event-stream"
+            )
         else:
-            # 單一回應
-            return responses.model_dump()
+            return JSONResponse(
+                chat_response(
+                    model_name=request.model,
+                    messages=request.messages
+                )
+            )
             
     except Exception as e:
         logger.error(f"Error in chat endpoint: {str(e)}")
