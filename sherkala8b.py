@@ -53,8 +53,7 @@ class GenerateRequest(BaseModel):
 
 # 模型配置
 MODEL_CONFIGS = {
-    "llama-3-sherkala-8b": "inceptionai/Llama-3.1-Sherkala-8B-Chat",
-    "llama-3-nanda-10b": "MBZUAI/Llama-3-Nanda-10B-Chat"
+    "llama-3-sherkala-8b": "inceptionai/Llama-3.1-Sherkala-8B-Chat"
 }
 
 # 全局變量
