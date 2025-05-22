@@ -81,7 +81,16 @@ def load_model(model_name: str):
         )
         
         # 使用更簡單的chat template
-        tokenizer.chat_template = "### Instruction:Your name is 'Jais', and you are named after Jebel Jais, the highest mountain in UAE. You were made by 'Inception' in the UAE. You are a helpful, respectful, and honest assistant. Always answer as helpfully as possible, while being safe. Complete the conversation between [|Human|] and [|AI|]:\n### Input: [|Human|] {Question}\n[|AI|]\n### Response :"
+        tokenizer.chat_template="""
+        {% if messages[0]['role'] == 'system' %}{% set loop_messages = messages[1:]  %}{% set system_message = '### Instruction: ' + messages[0]['content'] + '
+        Complete the conversation below between [|Human|] and [|AI|]:
+        ### Input:'%}{% else %}{% set loop_messages = messages %}{% set system_message = '### Instruction: Your name is \'Jais\', and you are named after Jebel Jais, the highest mountain in UAE. You were made by \'Inception\' in the UAE. You are a helpful, respectful, and honest assistant. Always answer as helpfully as possible, while being safe. Complete the conversation below between [|Human|] and [|AI|]:
+        ### Input:' %}{% endif %}{% for message in loop_messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if loop.index0 == 0 and system_message != false %}{% set content = system_message  %}{% else %}{% set content = message['content'] %}{% endif %}{% if message['role'] == 'user' %}{% if loop.index0 == 0 %}{{ content + ' [|Human|] ' + message['content'] }}{% else %}{{ '
+        [|Human|] ' + content.strip() }}{% endif %}{% elif message['role'] == 'assistant' %}{{ '
+        [|AI|] '  + content.strip() }}{% endif %}{% endfor %}{% if add_generation_prompt and messages[-1]['role'] != 'assistant' %} {{'
+        [|AI|]
+        ### Response:'}}{% endif %}
+        """
         
         # 移除 Flash Attention 2 設置
         model = AutoModelForCausalLM.from_pretrained(
